@@ -1,18 +1,37 @@
-import type { FeishuProbeResult } from "./types.js";
-import { createFeishuClient, type FeishuClientCredentials } from "./client.js";
+import type { FeishuConfig, FeishuProbeResult } from "./types.js";
+import { createFeishuClient } from "./client.js";
+import { resolveFeishuCredentials } from "./accounts.js";
 
-export async function probeFeishu(creds?: FeishuClientCredentials): Promise<FeishuProbeResult> {
-  if (!creds?.appId || !creds?.appSecret) {
+// Cache probe results to avoid hitting API rate limits
+// Cache for 24 hours (86400 seconds)
+const PROBE_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+const probeCache = new Map<string, { result: FeishuProbeResult; timestamp: number }>();
+
+function getCacheKey(cfg?: FeishuConfig): string {
+  if (!cfg?.appId) return "no-creds";
+  return `${cfg.appId}:${cfg.domain ?? "feishu"}`;
+}
+
+export async function probeFeishu(cfg?: FeishuConfig): Promise<FeishuProbeResult> {
+  const creds = resolveFeishuCredentials(cfg);
+  if (!creds) {
     return {
       ok: false,
       error: "missing credentials (appId, appSecret)",
     };
   }
 
+  // Check cache first
+  const cacheKey = getCacheKey(cfg);
+  const cached = probeCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < PROBE_CACHE_TTL_MS) {
+    return cached.result;
+  }
+
   try {
-    const client = createFeishuClient(creds);
-    // Use bot/v3/info API to get bot information
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK generic request method
+    const client = createFeishuClient(cfg!);
+    // Use im.chat.list as a simple connectivity test
+    // The bot info API path varies by SDK version
     const response = await (client as any).request({
       method: "GET",
       url: "/open-apis/bot/v3/info",
@@ -20,25 +39,39 @@ export async function probeFeishu(creds?: FeishuClientCredentials): Promise<Feis
     });
 
     if (response.code !== 0) {
-      return {
+      const result = {
         ok: false,
         appId: creds.appId,
         error: `API error: ${response.msg || `code ${response.code}`}`,
       };
+      probeCache.set(cacheKey, { result, timestamp: Date.now() });
+      return result;
     }
 
     const bot = response.bot || response.data?.bot;
-    return {
+    const result = {
       ok: true,
       appId: creds.appId,
       botName: bot?.bot_name,
       botOpenId: bot?.open_id,
     };
+    probeCache.set(cacheKey, { result, timestamp: Date.now() });
+    return result;
   } catch (err) {
-    return {
+    const result = {
       ok: false,
       appId: creds.appId,
       error: err instanceof Error ? err.message : String(err),
     };
+    probeCache.set(cacheKey, { result, timestamp: Date.now() });
+    return result;
   }
 }
+
+// Clear the probe cache (useful for testing or when credentials change)
+export function clearProbeCache(): void {
+  probeCache.clear();
+}
+
+// Export for testing
+export { PROBE_CACHE_TTL_MS };
